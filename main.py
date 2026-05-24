@@ -5,7 +5,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import sqlite3
-import json
 import os
 from datetime import datetime
 
@@ -33,7 +32,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Portfolio table — stores cash balance
     c.execute("""
         CREATE TABLE IF NOT EXISTS portfolio (
             id INTEGER PRIMARY KEY,
@@ -41,7 +39,6 @@ def init_db():
         )
     """)
 
-    # Holdings table — stores stock positions
     c.execute("""
         CREATE TABLE IF NOT EXISTS holdings (
             symbol TEXT PRIMARY KEY,
@@ -49,7 +46,6 @@ def init_db():
         )
     """)
 
-    # Trades table — full trade history
     c.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,19 +59,16 @@ def init_db():
         )
     """)
 
-    # Watchlist table
     c.execute("""
         CREATE TABLE IF NOT EXISTS watchlist (
             symbol TEXT PRIMARY KEY
         )
     """)
 
-    # Initialize cash if not exists
     c.execute("SELECT COUNT(*) FROM portfolio")
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO portfolio (id, cash) VALUES (1, 100000.0)")
 
-    # Initialize default watchlist if empty
     c.execute("SELECT COUNT(*) FROM watchlist")
     if c.fetchone()[0] == 0:
         default = [
@@ -89,7 +82,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Run on startup
 init_db()
 
 # --------------------------------------------------
@@ -143,7 +135,7 @@ def add_trade(type_, symbol, price, quantity, confidence, mode):
     conn.commit()
     conn.close()
 
-def get_trades():
+def get_all_trades():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT type, symbol, price, quantity, confidence, mode, time FROM trades ORDER BY id DESC LIMIT 100")
@@ -155,7 +147,7 @@ def get_trades():
         for r in rows
     ]
 
-def get_watchlist():
+def get_watchlist_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT symbol FROM watchlist")
@@ -163,14 +155,14 @@ def get_watchlist():
     conn.close()
     return [r[0] for r in rows]
 
-def add_to_watchlist(symbol):
+def add_to_watchlist_db(symbol):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO watchlist (symbol) VALUES (?)", (symbol,))
     conn.commit()
     conn.close()
 
-def remove_from_watchlist(symbol):
+def remove_from_watchlist_db(symbol):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM watchlist WHERE symbol=?", (symbol,))
@@ -178,7 +170,7 @@ def remove_from_watchlist(symbol):
     conn.close()
 
 # --------------------------------------------------
-# Signal log (in memory is fine — just latest scan)
+# Signal log
 # --------------------------------------------------
 
 signal_log = []
@@ -196,7 +188,7 @@ def calculate_rsi(data, window=14):
     return rsi
 
 # --------------------------------------------------
-# Get current price safely
+# Get current price
 # --------------------------------------------------
 
 def get_price(symbol: str):
@@ -276,7 +268,7 @@ def auto_trade():
     print(f"\n[BOT] Auto-scan at {datetime.now().strftime('%H:%M:%S')}")
     global signal_log
     new_signals = []
-    watchlist = get_watchlist()
+    watchlist = get_watchlist_db()
 
     for symbol in watchlist:
         result = analyze_symbol(symbol)
@@ -292,10 +284,11 @@ def auto_trade():
 
         if signal == "BUY" and confidence >= 65:
             cost = price * 1
-            if cash >= cost:
+            already_owns = holdings.get(symbol, 0) > 0
+            max_per_trade = cash * 0.20
+            if cash >= cost and not already_owns and cost <= max_per_trade:
                 set_cash(cash - cost)
-                current_qty = holdings.get(symbol, 0)
-                update_holding(symbol, current_qty + 1)
+                update_holding(symbol, 1)
                 add_trade("BUY", symbol, price, 1, confidence, "AUTO")
                 print(f"[BOT] BUY  {symbol} @ {price} (conf {confidence}%)")
 
@@ -346,12 +339,12 @@ def stock_history(symbol: str):
         close = data["Close"]
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
-        close = close.fillna(method="ffill")
+        close = close.ffill()
         return {
             "dates": [str(d.date()) for d in close.index],
             "prices": [round(float(p), 2) for p in close.tolist()]
         }
-    except Exception as e:
+    except Exception:
         return {"dates": [], "prices": []}
 
 @app.get("/candles/{symbol}")
@@ -438,9 +431,59 @@ def portfolio_value():
         "total_portfolio_value": round(cash + total_stock_value, 2)
     }
 
+@app.get("/portfolio/pnl")
+def portfolio_pnl():
+    holdings = get_holdings()
+    all_trades = get_all_trades()
+    cash = get_cash()
+
+    pnl_details = {}
+    total_invested = 0
+    total_current = 0
+
+    for symbol, quantity in holdings.items():
+        buy_trades = [t for t in all_trades if t["symbol"] == symbol and t["type"] == "BUY"]
+        if not buy_trades:
+            continue
+
+        avg_buy_price = sum(t["price"] for t in buy_trades) / len(buy_trades)
+        current_price = get_price(symbol)
+        if current_price is None:
+            continue
+
+        invested = avg_buy_price * quantity
+        current_value = current_price * quantity
+        pnl = current_value - invested
+        pnl_pct = ((current_price - avg_buy_price) / avg_buy_price) * 100
+
+        total_invested += invested
+        total_current += current_value
+
+        pnl_details[symbol] = {
+            "quantity": quantity,
+            "avg_buy_price": round(avg_buy_price, 2),
+            "current_price": current_price,
+            "invested": round(invested, 2),
+            "current_value": round(current_value, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2)
+        }
+
+    total_pnl = total_current - total_invested
+
+    return {
+        "holdings": pnl_details,
+        "total_invested": round(total_invested, 2),
+        "total_current_value": round(total_current, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_pct": round((total_pnl / total_invested * 100) if total_invested > 0 else 0, 2),
+        "cash": round(cash, 2),
+        "portfolio_value": round(cash + total_current, 2)
+    }
+
 @app.get("/trades")
 def get_trades_route():
-    return get_trades()
+    return get_all_trades()
 
 @app.get("/signals")
 def get_signals():
@@ -448,18 +491,18 @@ def get_signals():
 
 @app.get("/watchlist")
 def get_watchlist_route():
-    return get_watchlist()
+    return get_watchlist_db()
 
 @app.post("/watchlist/add/{symbol}")
 def add_watchlist(symbol: str):
     symbol = symbol.upper()
-    add_to_watchlist(symbol)
-    return {"message": f"{symbol} added to watchlist"}
+    add_to_watchlist_db(symbol)
+    return {"message": f"{symbol} added"}
 
 @app.delete("/watchlist/remove/{symbol}")
 def remove_watchlist(symbol: str):
     symbol = symbol.upper()
-    remove_from_watchlist(symbol)
+    remove_from_watchlist_db(symbol)
     return {"message": f"{symbol} removed"}
 
 @app.post("/scan")
