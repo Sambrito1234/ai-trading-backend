@@ -4,6 +4,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import sqlite3
 import json
 import os
 from datetime import datetime
@@ -11,7 +12,7 @@ from datetime import datetime
 app = FastAPI()
 
 # --------------------------------------------------
-# CORS — allows frontend from anywhere
+# CORS
 # --------------------------------------------------
 
 app.add_middleware(
@@ -23,29 +24,161 @@ app.add_middleware(
 )
 
 # --------------------------------------------------
-# Portfolio — stored in memory (persists while server runs)
+# DATABASE SETUP
 # --------------------------------------------------
 
-portfolio = {
-    "cash": 100000.0,
-    "stocks": {},
-    "trade_history": []
-}
+DB_PATH = "trading.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Portfolio table — stores cash balance
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS portfolio (
+            id INTEGER PRIMARY KEY,
+            cash REAL NOT NULL
+        )
+    """)
+
+    # Holdings table — stores stock positions
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS holdings (
+            symbol TEXT PRIMARY KEY,
+            quantity INTEGER NOT NULL
+        )
+    """)
+
+    # Trades table — full trade history
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            price REAL NOT NULL,
+            quantity INTEGER NOT NULL,
+            confidence INTEGER DEFAULT 0,
+            mode TEXT NOT NULL,
+            time TEXT NOT NULL
+        )
+    """)
+
+    # Watchlist table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            symbol TEXT PRIMARY KEY
+        )
+    """)
+
+    # Initialize cash if not exists
+    c.execute("SELECT COUNT(*) FROM portfolio")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO portfolio (id, cash) VALUES (1, 100000.0)")
+
+    # Initialize default watchlist if empty
+    c.execute("SELECT COUNT(*) FROM watchlist")
+    if c.fetchone()[0] == 0:
+        default = [
+            "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "SBIN.NS",
+            "WIPRO.NS", "ICICIBANK.NS", "BAJFINANCE.NS", "HINDUNILVR.NS",
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META"
+        ]
+        for sym in default:
+            c.execute("INSERT OR IGNORE INTO watchlist (symbol) VALUES (?)", (sym,))
+
+    conn.commit()
+    conn.close()
+
+# Run on startup
+init_db()
 
 # --------------------------------------------------
-# Watchlist — stocks the bot monitors automatically
+# DB HELPERS
 # --------------------------------------------------
 
-WATCHLIST = [
-    # Indian stocks
-    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "SBIN.NS",
-    "WIPRO.NS", "ICICIBANK.NS", "BAJFINANCE.NS", "HINDUNILVR.NS",
-    # US stocks
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META"
-]
+def get_cash():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT cash FROM portfolio WHERE id=1")
+    cash = c.fetchone()[0]
+    conn.close()
+    return cash
+
+def set_cash(amount):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE portfolio SET cash=? WHERE id=1", (amount,))
+    conn.commit()
+    conn.close()
+
+def get_holdings():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT symbol, quantity FROM holdings")
+    rows = c.fetchall()
+    conn.close()
+    return {row[0]: row[1] for row in rows}
+
+def update_holding(symbol, quantity):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if quantity <= 0:
+        c.execute("DELETE FROM holdings WHERE symbol=?", (symbol,))
+    else:
+        c.execute("""
+            INSERT INTO holdings (symbol, quantity) VALUES (?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET quantity=?
+        """, (symbol, quantity, quantity))
+    conn.commit()
+    conn.close()
+
+def add_trade(type_, symbol, price, quantity, confidence, mode):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO trades (type, symbol, price, quantity, confidence, mode, time)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (type_, symbol, price, quantity, confidence, mode,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+
+def get_trades():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT type, symbol, price, quantity, confidence, mode, time FROM trades ORDER BY id DESC LIMIT 100")
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {"type": r[0], "symbol": r[1], "price": r[2],
+         "quantity": r[3], "confidence": r[4], "mode": r[5], "time": r[6]}
+        for r in rows
+    ]
+
+def get_watchlist():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT symbol FROM watchlist")
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def add_to_watchlist(symbol):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO watchlist (symbol) VALUES (?)", (symbol,))
+    conn.commit()
+    conn.close()
+
+def remove_from_watchlist(symbol):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlist WHERE symbol=?", (symbol,))
+    conn.commit()
+    conn.close()
 
 # --------------------------------------------------
-# Signal log — stores latest auto-scan results
+# Signal log (in memory is fine — just latest scan)
 # --------------------------------------------------
 
 signal_log = []
@@ -82,7 +215,7 @@ def get_price(symbol: str):
         return None
 
 # --------------------------------------------------
-# Analyze stock — returns signal, RSI, SMA
+# Analyze stock
 # --------------------------------------------------
 
 def analyze_symbol(symbol: str):
@@ -102,14 +235,10 @@ def analyze_symbol(symbol: str):
         rsi_series = calculate_rsi(close)
         rsi = float(rsi_series.iloc[-1])
 
-        if np.isnan(rsi):
-            rsi = 50.0
-        if np.isnan(sma20):
-            sma20 = current_price
-        if np.isnan(sma50):
-            sma50 = current_price
+        if np.isnan(rsi): rsi = 50.0
+        if np.isnan(sma20): sma20 = current_price
+        if np.isnan(sma50): sma50 = current_price
 
-        # Signal logic: RSI + moving average crossover
         signal = "HOLD"
         confidence = 50
 
@@ -136,19 +265,20 @@ def analyze_symbol(symbol: str):
             "confidence": confidence,
             "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-    except Exception as e:
+    except Exception:
         return None
 
 # --------------------------------------------------
-# AUTO-TRADING BOT — runs on schedule
+# AUTO-TRADING BOT
 # --------------------------------------------------
 
 def auto_trade():
-    print(f"\n[BOT] Auto-scan started at {datetime.now().strftime('%H:%M:%S')}")
+    print(f"\n[BOT] Auto-scan at {datetime.now().strftime('%H:%M:%S')}")
     global signal_log
     new_signals = []
+    watchlist = get_watchlist()
 
-    for symbol in WATCHLIST:
+    for symbol in watchlist:
         result = analyze_symbol(symbol)
         if result is None:
             continue
@@ -157,52 +287,35 @@ def auto_trade():
         signal = result["signal"]
         price = result["current_price"]
         confidence = result["confidence"]
+        holdings = get_holdings()
+        cash = get_cash()
 
-        # Only act on high-confidence signals
         if signal == "BUY" and confidence >= 65:
             cost = price * 1
-            if portfolio["cash"] >= cost:
-                portfolio["cash"] -= cost
-                portfolio["stocks"][symbol] = portfolio["stocks"].get(symbol, 0) + 1
-                trade = {
-                    "type": "BUY",
-                    "symbol": symbol,
-                    "price": price,
-                    "quantity": 1,
-                    "confidence": confidence,
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "mode": "AUTO"
-                }
-                portfolio["trade_history"].append(trade)
-                print(f"[BOT] AUTO BUY  {symbol} @ ₹{price} (RSI {result['RSI']}, conf {confidence}%)")
+            if cash >= cost:
+                set_cash(cash - cost)
+                current_qty = holdings.get(symbol, 0)
+                update_holding(symbol, current_qty + 1)
+                add_trade("BUY", symbol, price, 1, confidence, "AUTO")
+                print(f"[BOT] BUY  {symbol} @ {price} (conf {confidence}%)")
 
         elif signal == "SELL" and confidence >= 65:
-            if symbol in portfolio["stocks"] and portfolio["stocks"][symbol] > 0:
-                portfolio["cash"] += price * 1
-                portfolio["stocks"][symbol] -= 1
-                if portfolio["stocks"][symbol] == 0:
-                    del portfolio["stocks"][symbol]
-                trade = {
-                    "type": "SELL",
-                    "symbol": symbol,
-                    "price": price,
-                    "quantity": 1,
-                    "confidence": confidence,
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "mode": "AUTO"
-                }
-                portfolio["trade_history"].append(trade)
-                print(f"[BOT] AUTO SELL {symbol} @ ₹{price} (RSI {result['RSI']}, conf {confidence}%)")
+            qty = holdings.get(symbol, 0)
+            if qty > 0:
+                set_cash(cash + price)
+                update_holding(symbol, qty - 1)
+                add_trade("SELL", symbol, price, 1, confidence, "AUTO")
+                print(f"[BOT] SELL {symbol} @ {price} (conf {confidence}%)")
 
     signal_log = new_signals
-    print(f"[BOT] Scan complete. {len(new_signals)} stocks analyzed.")
+    print(f"[BOT] Done. {len(new_signals)} stocks scanned.")
 
 # --------------------------------------------------
-# SCHEDULER — runs auto_trade every 5 minutes
+# SCHEDULER
 # --------------------------------------------------
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(auto_trade, "interval", minutes=5, id="auto_trade_job")
+scheduler.add_job(auto_trade, "interval", minutes=5, id="auto_trade")
 scheduler.start()
 
 # --------------------------------------------------
@@ -213,25 +326,16 @@ scheduler.start()
 def home():
     return {
         "message": "AI Trading Bot Running",
-        "watchlist": WATCHLIST,
         "auto_trading": "ACTIVE",
-        "next_scan": "Every 5 minutes"
+        "scan_interval": "Every 5 minutes"
     }
-
-# --------------------------------------------------
-# GET STOCK ANALYSIS
-# --------------------------------------------------
 
 @app.get("/stock/{symbol}")
 def get_stock(symbol: str):
     result = analyze_symbol(symbol)
     if result is None:
-        return {"error": f"Could not fetch data for {symbol}"}
+        return {"error": f"Could not fetch {symbol}"}
     return result
-
-# --------------------------------------------------
-# PRICE HISTORY FOR CHART
-# --------------------------------------------------
 
 @app.get("/history/{symbol}")
 def stock_history(symbol: str):
@@ -239,22 +343,16 @@ def stock_history(symbol: str):
         data = yf.download(symbol, period="1mo", progress=False)
         if data.empty:
             return {"dates": [], "prices": []}
-
         close = data["Close"]
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
         close = close.fillna(method="ffill")
-
         return {
             "dates": [str(d.date()) for d in close.index],
             "prices": [round(float(p), 2) for p in close.tolist()]
         }
     except Exception as e:
-        return {"dates": [], "prices": [], "error": str(e)}
-
-# --------------------------------------------------
-# CANDLESTICK DATA
-# --------------------------------------------------
+        return {"dates": [], "prices": []}
 
 @app.get("/candles/{symbol}")
 def get_candles(symbol: str):
@@ -262,100 +360,67 @@ def get_candles(symbol: str):
         data = yf.download(symbol, period="1mo", progress=False)
         if data.empty:
             return []
-
         candles = []
         for idx, row in data.iterrows():
             try:
                 candles.append({
                     "x": str(idx.date()),
-                    "o": round(float(row["Open"].iloc[0] if hasattr(row["Open"], "iloc") else row["Open"]), 2),
-                    "h": round(float(row["High"].iloc[0] if hasattr(row["High"], "iloc") else row["High"]), 2),
-                    "l": round(float(row["Low"].iloc[0] if hasattr(row["Low"], "iloc") else row["Low"]), 2),
-                    "c": round(float(row["Close"].iloc[0] if hasattr(row["Close"], "iloc") else row["Close"]), 2),
+                    "o": round(float(row["Open"]), 2),
+                    "h": round(float(row["High"]), 2),
+                    "l": round(float(row["Low"]), 2),
+                    "c": round(float(row["Close"]), 2),
                 })
             except Exception:
                 continue
         return candles
-    except Exception as e:
+    except Exception:
         return []
-
-# --------------------------------------------------
-# BUY STOCK (manual)
-# --------------------------------------------------
 
 @app.post("/buy/{symbol}")
 def buy_stock(symbol: str, quantity: int = 1):
     price = get_price(symbol)
     if price is None:
-        return {"error": "Invalid symbol or no data"}
-
+        return {"error": "Invalid symbol"}
+    cash = get_cash()
     total_cost = price * quantity
-    if portfolio["cash"] < total_cost:
+    if cash < total_cost:
         return {"error": "Not enough cash"}
-
-    portfolio["cash"] -= total_cost
-    portfolio["stocks"][symbol] = portfolio["stocks"].get(symbol, 0) + quantity
-
-    trade = {
-        "type": "BUY",
-        "symbol": symbol,
-        "price": price,
-        "quantity": quantity,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "mode": "MANUAL"
-    }
-    portfolio["trade_history"].append(trade)
-
+    set_cash(cash - total_cost)
+    holdings = get_holdings()
+    update_holding(symbol, holdings.get(symbol, 0) + quantity)
+    add_trade("BUY", symbol, price, quantity, 0, "MANUAL")
     return {
         "message": f"Bought {quantity} share(s) of {symbol}",
         "price": price,
-        "cash_remaining": round(portfolio["cash"], 2)
+        "cash_remaining": round(get_cash(), 2)
     }
-
-# --------------------------------------------------
-# SELL STOCK (manual)
-# --------------------------------------------------
 
 @app.post("/sell/{symbol}")
 def sell_stock(symbol: str, quantity: int = 1):
-    if symbol not in portfolio["stocks"] or portfolio["stocks"][symbol] < quantity:
-        return {"error": "Not enough shares to sell"}
-
+    holdings = get_holdings()
+    if holdings.get(symbol, 0) < quantity:
+        return {"error": "Not enough shares"}
     price = get_price(symbol)
     if price is None:
-        return {"error": "Invalid symbol or no data"}
-
-    portfolio["cash"] += price * quantity
-    portfolio["stocks"][symbol] -= quantity
-    if portfolio["stocks"][symbol] == 0:
-        del portfolio["stocks"][symbol]
-
-    trade = {
-        "type": "SELL",
-        "symbol": symbol,
-        "price": price,
-        "quantity": quantity,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "mode": "MANUAL"
-    }
-    portfolio["trade_history"].append(trade)
-
+        return {"error": "Invalid symbol"}
+    cash = get_cash()
+    set_cash(cash + price * quantity)
+    update_holding(symbol, holdings[symbol] - quantity)
+    add_trade("SELL", symbol, price, quantity, 0, "MANUAL")
     return {
         "message": f"Sold {quantity} share(s) of {symbol}",
         "price": price,
-        "cash_balance": round(portfolio["cash"], 2)
+        "cash_balance": round(get_cash(), 2)
     }
-
-# --------------------------------------------------
-# PORTFOLIO VALUE
-# --------------------------------------------------
 
 @app.get("/portfolio/value")
 def portfolio_value():
+    cash = get_cash()
+    holdings = get_holdings()
     total_stock_value = 0.0
     stock_details = {}
 
-    for symbol, quantity in portfolio["stocks"].items():
+    for symbol, quantity in holdings.items():
         price = get_price(symbol)
         if price is None:
             continue
@@ -368,63 +433,39 @@ def portfolio_value():
         }
 
     return {
-        "cash": round(portfolio["cash"], 2),
+        "cash": round(cash, 2),
         "stocks": stock_details,
-        "total_portfolio_value": round(portfolio["cash"] + total_stock_value, 2)
+        "total_portfolio_value": round(cash + total_stock_value, 2)
     }
 
-# --------------------------------------------------
-# TRADE HISTORY
-# --------------------------------------------------
-
 @app.get("/trades")
-def get_trades():
-    return list(reversed(portfolio["trade_history"]))
-
-# --------------------------------------------------
-# SIGNAL LOG — latest auto-scan results
-# --------------------------------------------------
+def get_trades_route():
+    return get_trades()
 
 @app.get("/signals")
 def get_signals():
     return signal_log
 
-# --------------------------------------------------
-# WATCHLIST MANAGEMENT
-# --------------------------------------------------
-
 @app.get("/watchlist")
-def get_watchlist():
-    return WATCHLIST
+def get_watchlist_route():
+    return get_watchlist()
 
 @app.post("/watchlist/add/{symbol}")
-def add_to_watchlist(symbol: str):
+def add_watchlist(symbol: str):
     symbol = symbol.upper()
-    if symbol not in WATCHLIST:
-        WATCHLIST.append(symbol)
-        return {"message": f"{symbol} added to watchlist"}
-    return {"message": f"{symbol} already in watchlist"}
+    add_to_watchlist(symbol)
+    return {"message": f"{symbol} added to watchlist"}
 
 @app.delete("/watchlist/remove/{symbol}")
-def remove_from_watchlist(symbol: str):
+def remove_watchlist(symbol: str):
     symbol = symbol.upper()
-    if symbol in WATCHLIST:
-        WATCHLIST.remove(symbol)
-        return {"message": f"{symbol} removed"}
-    return {"error": "Symbol not found"}
-
-# --------------------------------------------------
-# TRIGGER MANUAL SCAN
-# --------------------------------------------------
+    remove_from_watchlist(symbol)
+    return {"message": f"{symbol} removed"}
 
 @app.post("/scan")
 def trigger_scan():
     auto_trade()
     return {"message": "Scan complete", "signals": signal_log}
-
-# --------------------------------------------------
-# SHUTDOWN
-# --------------------------------------------------
 
 @app.on_event("shutdown")
 def shutdown():
