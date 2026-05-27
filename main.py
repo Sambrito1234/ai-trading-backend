@@ -22,13 +22,28 @@ app.add_middleware(
 )
 
 # --------------------------------------------------
-# CONFIG
+# CONFIG — your settings
 # --------------------------------------------------
-STOP_LOSS_PCT    = 2.5
-TAKE_PROFIT_PCT  = 5.0
-MIN_CONFIDENCE   = 65
-MAX_POSITION_PCT = 0.15   # max 15% of cash per trade
-STARTING_CASH    = 100000.0
+STOP_LOSS_PCT      = 1.5    # sell if price drops 1.5% from buy price
+PROFIT_TARGET_PCT  = 2.0    # sell only when profit >= 2%
+MAX_POSITION_PCT   = 0.15   # max 15% of cash per trade
+STARTING_CASH      = 100000.0
+
+# Large cap stocks — require STRONG signal to buy
+LARGE_CAP = {
+    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "SBIN.NS",
+    "ICICIBANK.NS", "KOTAKBANK.NS", "LT.NS", "BAJFINANCE.NS",
+    "HINDUNILVR.NS", "AXISBANK.NS", "MARUTI.NS", "TITAN.NS",
+    "SUNPHARMA.NS", "TATAMOTORS.NS", "NESTLEIND.NS", "ULTRACEMCO.NS",
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META",
+    "JPM", "V", "JNJ", "WMT", "UNH", "MA", "HD"
+}
+
+# Strong signal threshold (large caps)
+STRONG_SIGNAL_MIN_CONFIDENCE = 70
+
+# Decent signal threshold (smaller stocks)
+DECENT_SIGNAL_MIN_CONFIDENCE = 55
 
 # --------------------------------------------------
 # DATABASE
@@ -56,6 +71,7 @@ def init_db():
         confidence INTEGER DEFAULT 0,
         mode TEXT NOT NULL,
         reason TEXT DEFAULT '',
+        pnl REAL DEFAULT 0,
         time TEXT NOT NULL)""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS watchlist (
@@ -75,16 +91,13 @@ def init_db():
     c.execute("SELECT COUNT(*) FROM watchlist")
     if c.fetchone()[0] == 0:
         default = [
-            # Indian Large Cap
             "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "SBIN.NS",
             "WIPRO.NS", "ICICIBANK.NS", "BAJFINANCE.NS", "HINDUNILVR.NS",
             "AXISBANK.NS", "KOTAKBANK.NS", "LT.NS", "MARUTI.NS", "TITAN.NS",
             "SUNPHARMA.NS", "TATAMOTORS.NS", "ADANIENT.NS", "ULTRACEMCO.NS",
             "ASIANPAINT.NS", "NESTLEIND.NS",
-            # US Large Cap
             "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META",
             "JPM", "V", "JNJ", "WMT", "UNH", "MA", "HD",
-            # Crypto
             "BTC-USD", "ETH-USD", "BNB-USD"
         ]
         for sym in default:
@@ -133,12 +146,12 @@ def update_holding(symbol, quantity, avg_buy_price=0):
     conn.commit()
     conn.close()
 
-def add_trade(type_, symbol, price, quantity, confidence, mode, reason=""):
+def add_trade(type_, symbol, price, quantity, confidence, mode, reason="", pnl=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""INSERT INTO trades (type,symbol,price,quantity,confidence,mode,reason,time)
-        VALUES (?,?,?,?,?,?,?,?)""",
-        (type_, symbol, price, quantity, confidence, mode, reason,
+    c.execute("""INSERT INTO trades (type,symbol,price,quantity,confidence,mode,reason,pnl,time)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (type_, symbol, price, quantity, confidence, mode, reason, pnl,
          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
@@ -146,12 +159,13 @@ def add_trade(type_, symbol, price, quantity, confidence, mode, reason=""):
 def get_all_trades():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""SELECT type,symbol,price,quantity,confidence,mode,reason,time
+    c.execute("""SELECT type,symbol,price,quantity,confidence,mode,reason,pnl,time
         FROM trades ORDER BY id DESC LIMIT 200""")
     rows = c.fetchall()
     conn.close()
     return [{"type":r[0],"symbol":r[1],"price":r[2],"quantity":r[3],
-             "confidence":r[4],"mode":r[5],"reason":r[6],"time":r[7]} for r in rows]
+             "confidence":r[4],"mode":r[5],"reason":r[6],"pnl":round(r[7],2),"time":r[8]}
+            for r in rows]
 
 def get_watchlist_db():
     conn = sqlite3.connect(DB_PATH)
@@ -199,8 +213,7 @@ def save_daily_snapshot():
 def get_daily_pnl_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""SELECT date,portfolio_value,pnl,pnl_pct FROM daily_pnl
-        ORDER BY date DESC LIMIT 30""")
+    c.execute("SELECT date,portfolio_value,pnl,pnl_pct FROM daily_pnl ORDER BY date DESC LIMIT 30")
     rows = c.fetchall()
     conn.close()
     return [{"date":r[0],"portfolio_value":round(r[1],2),
@@ -276,7 +289,7 @@ def get_price(symbol: str):
         return None
 
 # --------------------------------------------------
-# FULL ANALYSIS
+# ANALYZE STOCK — returns buy score
 # --------------------------------------------------
 def analyze_symbol(symbol: str):
     try:
@@ -306,9 +319,7 @@ def analyze_symbol(symbol: str):
         macd_sig_val = float(macd_sig.iloc[-1])
         macd_hist_val = float(macd_hist.iloc[-1])
         macd_bullish = macd_val > macd_sig_val and macd_hist_val > 0
-        macd_bearish = macd_val < macd_sig_val and macd_hist_val < 0
 
-        # Bollinger Bands
         sma20_bb = close.rolling(20).mean()
         std20 = close.rolling(20).std()
         bb_upper = float((sma20_bb + 2 * std20).iloc[-1])
@@ -318,54 +329,27 @@ def analyze_symbol(symbol: str):
         volume_confirms = get_volume_signal(data)
         sentiment = get_news_sentiment(symbol)
 
-        # --- SCORING ---
+        # --- BUY SCORING ---
         buy_score = 0
-        sell_score = 0
 
-        # RSI
         if rsi < 25: buy_score += 4
-        elif rsi < 35: buy_score += 2
+        elif rsi < 35: buy_score += 3
         elif rsi < 45: buy_score += 1
-        if rsi > 75: sell_score += 4
-        elif rsi > 65: sell_score += 2
-        elif rsi > 55: sell_score += 1
 
-        # SMA trend
         if sma20 > sma50: buy_score += 2
-        else: sell_score += 2
         if current_price > sma200: buy_score += 1
-        else: sell_score += 1
-
-        # MACD
         if macd_bullish: buy_score += 3
-        if macd_bearish: sell_score += 3
-
-        # Bollinger Bands
         if bb_position < 0.2: buy_score += 2
-        elif bb_position > 0.8: sell_score += 2
-
-        # Volume
-        if volume_confirms:
-            if buy_score > sell_score: buy_score += 1
-            else: sell_score += 1
-
-        # Sentiment
+        elif bb_position < 0.35: buy_score += 1
+        if volume_confirms: buy_score += 1
         if sentiment == 1: buy_score += 2
-        elif sentiment == -1:
-            sell_score += 2
-            if buy_score > sell_score: buy_score -= 2  # block bad news buys
+        elif sentiment == -1: buy_score -= 3  # block bad news
 
-        # --- DECISION ---
-        max_score = 15
-        signal = "HOLD"
-        confidence = 50
+        # Confidence out of 15
+        confidence = min(95, int(50 + (buy_score / 15) * 50))
 
-        if buy_score > sell_score and buy_score >= 5:
-            signal = "BUY"
-            confidence = min(95, int(50 + (buy_score / max_score) * 50))
-        elif sell_score > buy_score and sell_score >= 5:
-            signal = "SELL"
-            confidence = min(95, int(50 + (sell_score / max_score) * 50))
+        # Signal — BUY only (we sell based on profit, not signal)
+        signal = "BUY" if buy_score >= 4 else "WATCH"
 
         return {
             "symbol": symbol,
@@ -375,7 +359,6 @@ def analyze_symbol(symbol: str):
             "SMA50": round(sma50, 2),
             "SMA200": round(sma200, 2),
             "MACD": round(macd_val, 4),
-            "MACD_signal": round(macd_sig_val, 4),
             "MACD_bullish": macd_bullish,
             "BB_upper": round(bb_upper, 2),
             "BB_lower": round(bb_lower, 2),
@@ -383,9 +366,9 @@ def analyze_symbol(symbol: str):
             "volume_confirms": volume_confirms,
             "sentiment": sentiment,
             "buy_score": buy_score,
-            "sell_score": sell_score,
             "signal": signal,
             "confidence": confidence,
+            "is_large_cap": symbol in LARGE_CAP,
             "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
     except Exception as e:
@@ -393,46 +376,67 @@ def analyze_symbol(symbol: str):
         return None
 
 # --------------------------------------------------
-# STOP LOSS + TAKE PROFIT
+# PROFIT-FIRST SELL CHECKER
+# Runs every scan — only sells when profit >= 2%
 # --------------------------------------------------
-def check_stop_loss_take_profit():
+def check_profit_and_stoploss():
     holdings = get_holdings()
+
     for symbol, data in holdings.items():
         qty = data["quantity"]
         avg_buy = data["avg_buy_price"]
         if avg_buy == 0 or qty == 0:
             continue
+
         current_price = get_price(symbol)
         if current_price is None:
             continue
+
         pnl_pct = ((current_price - avg_buy) / avg_buy) * 100
+        pnl_amount = (current_price - avg_buy) * qty
         cash = get_cash()
 
-        if pnl_pct <= -STOP_LOSS_PCT:
+        # TAKE PROFIT — sell only when >= 2% profit
+        if pnl_pct >= PROFIT_TARGET_PCT:
             set_cash(cash + current_price * qty)
             update_holding(symbol, 0)
-            add_trade("SELL", symbol, current_price, qty, 100, "AUTO",
-                f"🛑 STOP LOSS at {pnl_pct:.1f}%")
-            print(f"[STOP LOSS] {symbol} @ {current_price} ({pnl_pct:.1f}%)")
+            add_trade(
+                "SELL", symbol, current_price, qty, 100, "AUTO",
+                f"PROFIT TARGET hit: +{pnl_pct:.2f}% (bought @ ₹{avg_buy})",
+                pnl_amount
+            )
+            print(f"[PROFIT] {symbol} SOLD @ {current_price} | +{pnl_pct:.2f}% | P&L: +₹{pnl_amount:.2f}")
 
-        elif pnl_pct >= TAKE_PROFIT_PCT:
+        # STOP LOSS — cut loss at 1.5%
+        elif pnl_pct <= -STOP_LOSS_PCT:
             set_cash(cash + current_price * qty)
             update_holding(symbol, 0)
-            add_trade("SELL", symbol, current_price, qty, 100, "AUTO",
-                f"🎯 TAKE PROFIT at +{pnl_pct:.1f}%")
-            print(f"[TAKE PROFIT] {symbol} @ {current_price} (+{pnl_pct:.1f}%)")
+            add_trade(
+                "SELL", symbol, current_price, qty, 100, "AUTO",
+                f"STOP LOSS hit: {pnl_pct:.2f}% (bought @ ₹{avg_buy})",
+                pnl_amount
+            )
+            print(f"[STOPLOSS] {symbol} SOLD @ {current_price} | {pnl_pct:.2f}% | Loss: ₹{pnl_amount:.2f}")
+
+        else:
+            # Still holding — log current status
+            print(f"[HOLD] {symbol} @ {current_price} | P&L: {pnl_pct:+.2f}% | Waiting for {PROFIT_TARGET_PCT}% target")
 
 # --------------------------------------------------
-# AUTO-TRADING BOT
+# AUTO-TRADING BOT — BUY LOGIC
 # --------------------------------------------------
 def auto_trade():
-    print(f"\n[BOT] Scan at {datetime.now().strftime('%H:%M:%S')}")
+    print(f"\n[BOT] ===== Scan at {datetime.now().strftime('%H:%M:%S')} =====")
     global signal_log
 
-    check_stop_loss_take_profit()
+    # STEP 1 — Check profit/stoploss on existing holdings first
+    check_profit_and_stoploss()
 
+    # STEP 2 — Scan watchlist for BUY opportunities
     new_signals = []
     watchlist = get_watchlist_db()
+    holdings = get_holdings()
+    cash = get_cash()
 
     for symbol in watchlist:
         result = analyze_symbol(symbol)
@@ -440,41 +444,52 @@ def auto_trade():
             continue
 
         new_signals.append(result)
-        signal = result["signal"]
+
+        # Skip if already holding this stock
+        if symbol in holdings:
+            continue
+
+        # Skip if not enough cash
         price = result["current_price"]
+        if cash < price:
+            continue
+
+        # Skip if position would exceed max %
+        if price > cash * MAX_POSITION_PCT:
+            continue
+
+        # Skip if bad news sentiment
+        if result["sentiment"] == -1:
+            print(f"[SKIP] {symbol} — negative news sentiment")
+            continue
+
         confidence = result["confidence"]
-        holdings = get_holdings()
-        cash = get_cash()
+        is_large = result["is_large_cap"]
 
-        if signal == "BUY" and confidence >= MIN_CONFIDENCE:
-            cost = price
-            already_owns = symbol in holdings
-            max_trade = cash * MAX_POSITION_PCT
-            if cash >= cost and not already_owns and cost <= max_trade:
-                set_cash(cash - cost)
-                update_holding(symbol, 1, price)
-                add_trade("BUY", symbol, price, 1, confidence, "AUTO",
-                    f"RSI:{result['RSI']} MACD:{'▲' if result['MACD_bullish'] else '▼'} BB:{result['BB_position']}% Vol:{'✓' if result['volume_confirms'] else '✗'} News:{result['sentiment']}")
-                print(f"[BOT] BUY  {symbol} @ {price} ({confidence}%)")
+        # SMART BUY LOGIC:
+        # Large caps → need strong signal (70%+ confidence)
+        # Others → decent signal is enough (55%+ confidence)
+        min_conf = STRONG_SIGNAL_MIN_CONFIDENCE if is_large else DECENT_SIGNAL_MIN_CONFIDENCE
 
-        elif signal == "SELL" and confidence >= MIN_CONFIDENCE:
-            if symbol in holdings:
-                qty = holdings[symbol]["quantity"]
-                set_cash(cash + price * qty)
-                update_holding(symbol, 0)
-                add_trade("SELL", symbol, price, qty, confidence, "AUTO",
-                    f"RSI:{result['RSI']} MACD:{'▲' if result['MACD_bullish'] else '▼'} BB:{result['BB_position']}%")
-                print(f"[BOT] SELL {symbol} @ {price} ({confidence}%)")
+        if confidence >= min_conf and result["signal"] == "BUY":
+            set_cash(cash - price)
+            update_holding(symbol, 1, price)
+            add_trade(
+                "BUY", symbol, price, 1, confidence, "AUTO",
+                f"{'STRONG' if is_large else 'DECENT'} signal | Score:{result['buy_score']} RSI:{result['RSI']} MACD:{'▲' if result['MACD_bullish'] else '▼'} Vol:{'✓' if result['volume_confirms'] else '✗'} News:{result['sentiment']}",
+                0
+            )
+            cash = get_cash()  # refresh after buy
+            print(f"[BUY] {symbol} @ ₹{price} | conf:{confidence}% | {'LARGE CAP' if is_large else 'small cap'} | Score:{result['buy_score']}")
 
     signal_log = new_signals
-    print(f"[BOT] Done. {len(new_signals)} scanned.")
+    print(f"[BOT] Done. {len(new_signals)} scanned | {len(get_holdings())} holdings | Cash: ₹{get_cash():.2f}")
 
 # --------------------------------------------------
 # SCHEDULER
 # --------------------------------------------------
 scheduler = BackgroundScheduler()
 scheduler.add_job(auto_trade, "interval", minutes=5, id="auto_trade")
-# Daily snapshots — NSE close (10:05 UTC) and NYSE close (21:05 UTC)
 scheduler.add_job(save_daily_snapshot, "cron", hour=10, minute=5, id="nse_snapshot")
 scheduler.add_job(save_daily_snapshot, "cron", hour=21, minute=5, id="nyse_snapshot")
 scheduler.start()
@@ -485,12 +500,13 @@ scheduler.start()
 @app.get("/")
 def home():
     return {
-        "message": "AI Trading Bot Running",
-        "auto_trading": "ACTIVE",
-        "stop_loss": f"{STOP_LOSS_PCT}%",
-        "take_profit": f"{TAKE_PROFIT_PCT}%",
-        "min_confidence": f"{MIN_CONFIDENCE}%",
-        "watchlist_size": len(get_watchlist_db())
+        "message": "AI Trading Bot — Profit First Strategy",
+        "strategy": f"Buy on signal, sell at +{PROFIT_TARGET_PCT}% profit or -{STOP_LOSS_PCT}% loss",
+        "large_cap_min_confidence": f"{STRONG_SIGNAL_MIN_CONFIDENCE}%",
+        "small_cap_min_confidence": f"{DECENT_SIGNAL_MIN_CONFIDENCE}%",
+        "profit_target": f"+{PROFIT_TARGET_PCT}%",
+        "stop_loss": f"-{STOP_LOSS_PCT}%",
+        "auto_trading": "ACTIVE"
     }
 
 @app.get("/stock/{symbol}")
@@ -531,8 +547,15 @@ def buy_stock(symbol: str, quantity: int = 1):
     new_qty = existing_qty + quantity
     new_avg = ((existing_avg * existing_qty) + (price * quantity)) / new_qty
     update_holding(symbol, new_qty, new_avg)
-    add_trade("BUY", symbol, price, quantity, 0, "MANUAL", "Manual buy")
-    return {"message": f"Bought {quantity} share(s) of {symbol}", "price": price, "cash_remaining": round(get_cash(), 2)}
+    add_trade("BUY", symbol, price, quantity, 0, "MANUAL",
+              f"Manual buy | target sell: ₹{round(price * (1 + PROFIT_TARGET_PCT/100), 2)}", 0)
+    return {
+        "message": f"Bought {quantity} share(s) of {symbol}",
+        "price": price,
+        "target_sell_price": round(price * (1 + PROFIT_TARGET_PCT / 100), 2),
+        "stop_loss_price": round(price * (1 - STOP_LOSS_PCT / 100), 2),
+        "cash_remaining": round(get_cash(), 2)
+    }
 
 @app.post("/sell/{symbol}")
 def sell_stock(symbol: str, quantity: int = 1):
@@ -542,12 +565,21 @@ def sell_stock(symbol: str, quantity: int = 1):
     price = get_price(symbol)
     if price is None:
         return {"error": "Invalid symbol"}
+    avg_buy = holdings[symbol]["avg_buy_price"]
+    pnl = (price - avg_buy) * quantity
     cash = get_cash()
     set_cash(cash + price * quantity)
     new_qty = holdings[symbol]["quantity"] - quantity
-    update_holding(symbol, new_qty, holdings[symbol]["avg_buy_price"])
-    add_trade("SELL", symbol, price, quantity, 0, "MANUAL", "Manual sell")
-    return {"message": f"Sold {quantity} share(s) of {symbol}", "price": price, "cash_balance": round(get_cash(), 2)}
+    update_holding(symbol, new_qty, avg_buy)
+    add_trade("SELL", symbol, price, quantity, 0, "MANUAL",
+              f"Manual sell | P&L: {'+'if pnl>=0 else ''}₹{pnl:.2f}", pnl)
+    return {
+        "message": f"Sold {quantity} share(s) of {symbol}",
+        "price": price,
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(((price - avg_buy) / avg_buy) * 100, 2),
+        "cash_balance": round(get_cash(), 2)
+    }
 
 @app.get("/portfolio/value")
 def portfolio_value():
@@ -594,6 +626,12 @@ def portfolio_pnl():
         pnl_pct = ((current_price - avg_buy) / avg_buy * 100) if avg_buy > 0 else 0
         total_invested += invested
         total_current += current_value
+
+        target_price = round(avg_buy * (1 + PROFIT_TARGET_PCT / 100), 2)
+        stop_price = round(avg_buy * (1 - STOP_LOSS_PCT / 100), 2)
+        distance_to_target = round(target_price - current_price, 2)
+        progress_to_target = round((pnl_pct / PROFIT_TARGET_PCT) * 100, 1)
+
         pnl_details[symbol] = {
             "quantity": qty,
             "avg_buy_price": round(avg_buy, 2),
@@ -602,13 +640,20 @@ def portfolio_pnl():
             "current_value": round(current_value, 2),
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
-            "stop_loss_price": round(avg_buy * (1 - STOP_LOSS_PCT / 100), 2),
-            "take_profit_price": round(avg_buy * (1 + TAKE_PROFIT_PCT / 100), 2)
+            "stop_loss_price": stop_price,
+            "target_sell_price": target_price,
+            "distance_to_target": distance_to_target,
+            "progress_to_target_pct": min(100, max(0, progress_to_target)),
+            "is_large_cap": symbol in LARGE_CAP
         }
 
     total_pnl = total_current - total_invested
     overall_pnl = (cash + total_current) - STARTING_CASH
     overall_pnl_pct = (overall_pnl / STARTING_CASH) * 100
+
+    # Realized P&L from trade history
+    all_trades = get_all_trades()
+    realized_pnl = sum(t["pnl"] for t in all_trades if t["type"] == "SELL")
 
     return {
         "holdings": pnl_details,
@@ -619,17 +664,15 @@ def portfolio_pnl():
         "cash": round(cash, 2),
         "portfolio_value": round(cash + total_current, 2),
         "overall_pnl": round(overall_pnl, 2),
-        "overall_pnl_pct": round(overall_pnl_pct, 2)
+        "overall_pnl_pct": round(overall_pnl_pct, 2),
+        "realized_pnl": round(realized_pnl, 2),
+        "profit_target_pct": PROFIT_TARGET_PCT,
+        "stop_loss_pct": STOP_LOSS_PCT
     }
 
 @app.get("/daily-pnl")
 def get_daily_pnl():
     return get_daily_pnl_db()
-
-@app.post("/daily-pnl/snapshot")
-def manual_snapshot():
-    save_daily_snapshot()
-    return {"message": "Snapshot saved", "data": get_daily_pnl_db()}
 
 @app.get("/trades")
 def get_trades_route():
@@ -664,18 +707,69 @@ def trigger_scan():
 @app.get("/stats")
 def get_stats():
     trades = get_all_trades()
-    buy_trades = [t for t in trades if t["type"] == "BUY"]
     sell_trades = [t for t in trades if t["type"] == "SELL"]
-    auto_trades = [t for t in trades if t["mode"] == "AUTO"]
+    profit_trades = [t for t in sell_trades if t["pnl"] > 0]
+    loss_trades = [t for t in sell_trades if t["pnl"] <= 0]
+    realized_pnl = sum(t["pnl"] for t in sell_trades)
+    win_rate = round((len(profit_trades) / len(sell_trades) * 100) if sell_trades else 0, 1)
+
     return {
         "total_trades": len(trades),
-        "total_buys": len(buy_trades),
+        "total_buys": len([t for t in trades if t["type"] == "BUY"]),
         "total_sells": len(sell_trades),
-        "auto_trades": len(auto_trades),
-        "manual_trades": len(trades) - len(auto_trades),
+        "profitable_sells": len(profit_trades),
+        "loss_sells": len(loss_trades),
+        "win_rate_pct": win_rate,
+        "realized_pnl": round(realized_pnl, 2),
+        "auto_trades": len([t for t in trades if t["mode"] == "AUTO"]),
+        "manual_trades": len([t for t in trades if t["mode"] == "MANUAL"]),
         "watchlist_size": len(get_watchlist_db()),
-        "holdings_count": len(get_holdings())
+        "current_holdings": len(get_holdings()),
+        "profit_target_pct": PROFIT_TARGET_PCT,
+        "stop_loss_pct": STOP_LOSS_PCT
     }
+
+
+@app.get("/daily-trades")
+def get_daily_trades():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT type, symbol, price, quantity, confidence, mode, reason, pnl, time
+        FROM trades
+        ORDER BY time DESC
+        LIMIT 500
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    # Group by date
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rows:
+        date = r[8][:10]  # extract YYYY-MM-DD
+        grouped[date].append({
+            "type": r[0], "symbol": r[1], "price": r[2],
+            "quantity": r[3], "confidence": r[4], "mode": r[5],
+            "reason": r[6], "pnl": round(r[7], 2), "time": r[8]
+        })
+
+    result = []
+    for date in sorted(grouped.keys(), reverse=True):
+        day_trades = grouped[date]
+        buys = [t for t in day_trades if t["type"] == "BUY"]
+        sells = [t for t in day_trades if t["type"] == "SELL"]
+        realized = sum(t["pnl"] for t in sells)
+        result.append({
+            "date": date,
+            "trades": day_trades,
+            "total_trades": len(day_trades),
+            "buys": len(buys),
+            "sells": len(sells),
+            "realized_pnl": round(realized, 2)
+        })
+
+    return result
 
 @app.on_event("shutdown")
 def shutdown():
