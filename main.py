@@ -10,9 +10,6 @@ from collections import defaultdict
 
 app = FastAPI()
 
-# --------------------------------------------------
-# CORS
-# --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,13 +21,28 @@ app.add_middleware(
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
-INTRADAY_PROFIT_TARGET_PCT = 2.0    # sell during day at +2%
-EOD_MIN_PROFIT_PCT         = 0.5    # sell at EOD if profit >= 0.5%
-STOP_LOSS_PCT              = 1.5    # NEVER sell at loss (only emergency)
-MAX_POSITION_PCT           = 0.12   # max 12% of cash per trade
+INTRADAY_PROFIT_TARGET_PCT = 2.0   # sell intraday at +2%
+EOD_MIN_PROFIT_PCT         = 0.5   # sell at EOD if >= +0.5%
+MAX_HOLDINGS               = 10    # max 10 stocks at once
+MAX_BUYS_PER_SCAN          = 3     # buy only top 3 signals per scan
 STARTING_CASH              = 100000.0
 
-# Large caps need stronger signal
+# Smart position sizing based on confidence
+# confidence >= 85 → allocate 20% of cash
+# confidence >= 75 → allocate 15% of cash
+# confidence >= 65 → allocate 10% of cash
+# confidence >= 55 → allocate 7% of cash
+def get_position_size(confidence, cash):
+    if confidence >= 85:
+        pct = 0.20
+    elif confidence >= 75:
+        pct = 0.15
+    elif confidence >= 65:
+        pct = 0.10
+    else:
+        pct = 0.07
+    return round(cash * pct, 2)
+
 LARGE_CAP = {
     "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","SBIN.NS",
     "ICICIBANK.NS","KOTAKBANK.NS","LT.NS","BAJFINANCE.NS","HINDUNILVR.NS",
@@ -39,8 +51,8 @@ LARGE_CAP = {
     "GOOGL","AMZN","NVDA","TSLA","META","JPM","V","JNJ","WMT","UNH","MA","HD"
 }
 
-STRONG_CONF = 70   # large caps
-DECENT_CONF = 55   # small caps
+STRONG_CONF = 70
+DECENT_CONF = 55
 
 # --------------------------------------------------
 # DATABASE
@@ -57,7 +69,8 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS holdings (
         symbol TEXT PRIMARY KEY,
         quantity INTEGER NOT NULL,
-        avg_buy_price REAL DEFAULT 0)""")
+        avg_buy_price REAL DEFAULT 0,
+        invested_amount REAL DEFAULT 0)""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +78,7 @@ def init_db():
         symbol TEXT NOT NULL,
         price REAL NOT NULL,
         quantity INTEGER NOT NULL,
+        invested REAL DEFAULT 0,
         confidence INTEGER DEFAULT 0,
         mode TEXT NOT NULL,
         reason TEXT DEFAULT '',
@@ -78,10 +92,10 @@ def init_db():
         date TEXT PRIMARY KEY,
         portfolio_value REAL NOT NULL,
         cash REAL NOT NULL,
-        pnl REAL DEFAULT 0,
+        realized_pnl_today REAL DEFAULT 0,
+        cumulative_pnl REAL DEFAULT 0,
         pnl_pct REAL DEFAULT 0)""")
 
-    # Tracks stocks sold at a loss today — bot will NOT rebuy these
     c.execute("""CREATE TABLE IF NOT EXISTS loss_cooldown (
         symbol TEXT NOT NULL,
         date TEXT NOT NULL,
@@ -94,7 +108,6 @@ def init_db():
     c.execute("SELECT COUNT(*) FROM watchlist")
     if c.fetchone()[0] == 0:
         default = [
-            # Indian Large Cap
             "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","SBIN.NS",
             "WIPRO.NS","ICICIBANK.NS","BAJFINANCE.NS","HINDUNILVR.NS",
             "AXISBANK.NS","KOTAKBANK.NS","LT.NS","MARUTI.NS","TITAN.NS",
@@ -103,14 +116,11 @@ def init_db():
             "COALINDIA.NS","BAJAJFINSV.NS","HCLTECH.NS","TECHM.NS","DRREDDY.NS",
             "DIVISLAB.NS","CIPLA.NS","EICHERMOT.NS","HEROMOTOCO.NS","BPCL.NS",
             "GRASIM.NS","INDUSINDBK.NS","SBILIFE.NS","HDFCLIFE.NS","BRITANNIA.NS",
-            "TATACONSUM.NS","UPL.NS","APOLLOHOSP.NS","ADANIPORTS.NS","JSWSTEEL.NS",
-            "TATASTEEL.NS","HINDALCO.NS","VEDL.NS","SAIL.NS","NMDC.NS",
-            # US Large Cap
+            "TATACONSUM.NS","APOLLOHOSP.NS","ADANIPORTS.NS","JSWSTEEL.NS",
+            "TATASTEEL.NS","HINDALCO.NS",
             "AAPL","MSFT","GOOGL","AMZN","NVDA","TSLA","META",
             "JPM","V","JNJ","WMT","UNH","MA","HD","BAC",
             "PFE","KO","PEP","NFLX","AMD","INTC","CRM","ORCL",
-            "UBER","PYPL","SQ","SHOP","ROKU","SNAP","TWTR",
-            # Crypto
             "BTC-USD","ETH-USD","BNB-USD","SOL-USD","ADA-USD","XRP-USD"
         ]
         for sym in default:
@@ -142,29 +152,33 @@ def set_cash(amount):
 def get_holdings():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT symbol, quantity, avg_buy_price FROM holdings WHERE quantity > 0")
+    c.execute("SELECT symbol, quantity, avg_buy_price, invested_amount FROM holdings WHERE quantity > 0")
     rows = c.fetchall()
     conn.close()
-    return {r[0]: {"quantity": r[1], "avg_buy_price": r[2]} for r in rows}
+    return {r[0]: {"quantity": r[1], "avg_buy_price": r[2], "invested_amount": r[3]} for r in rows}
 
-def update_holding(symbol, quantity, avg_buy_price=0):
+def update_holding(symbol, quantity, avg_buy_price=0, invested_amount=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if quantity <= 0:
         c.execute("DELETE FROM holdings WHERE symbol=?", (symbol,))
     else:
-        c.execute("""INSERT INTO holdings (symbol, quantity, avg_buy_price) VALUES (?,?,?)
-            ON CONFLICT(symbol) DO UPDATE SET quantity=?, avg_buy_price=?""",
-            (symbol, quantity, avg_buy_price, quantity, avg_buy_price))
+        c.execute("""INSERT INTO holdings (symbol, quantity, avg_buy_price, invested_amount)
+            VALUES (?,?,?,?)
+            ON CONFLICT(symbol) DO UPDATE SET
+            quantity=?, avg_buy_price=?, invested_amount=?""",
+            (symbol, quantity, avg_buy_price, invested_amount,
+             quantity, avg_buy_price, invested_amount))
     conn.commit()
     conn.close()
 
-def add_trade(type_, symbol, price, quantity, confidence, mode, reason="", pnl=0):
+def add_trade(type_, symbol, price, quantity, invested, confidence, mode, reason="", pnl=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""INSERT INTO trades (type,symbol,price,quantity,confidence,mode,reason,pnl,time)
-        VALUES (?,?,?,?,?,?,?,?,?)""",
-        (type_, symbol, price, quantity, confidence, mode, reason, pnl,
+    c.execute("""INSERT INTO trades
+        (type,symbol,price,quantity,invested,confidence,mode,reason,pnl,time)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (type_, symbol, price, quantity, invested, confidence, mode, reason, pnl,
          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
@@ -172,13 +186,23 @@ def add_trade(type_, symbol, price, quantity, confidence, mode, reason="", pnl=0
 def get_all_trades():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""SELECT type,symbol,price,quantity,confidence,mode,reason,pnl,time
+    c.execute("""SELECT type,symbol,price,quantity,invested,confidence,mode,reason,pnl,time
         FROM trades ORDER BY id DESC LIMIT 500""")
     rows = c.fetchall()
     conn.close()
     return [{"type":r[0],"symbol":r[1],"price":r[2],"quantity":r[3],
-             "confidence":r[4],"mode":r[5],"reason":r[6],"pnl":round(r[7],2),"time":r[8]}
-            for r in rows]
+             "invested":round(r[4],2),"confidence":r[5],"mode":r[6],
+             "reason":r[7],"pnl":round(r[8],2),"time":r[9]} for r in rows]
+
+def get_todays_realized_pnl():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("""SELECT SUM(pnl) FROM trades
+        WHERE type='SELL' AND time LIKE ?""", (f"{today}%",))
+    result = c.fetchone()[0]
+    conn.close()
+    return round(result or 0, 2)
 
 def get_watchlist_db():
     conn = sqlite3.connect(DB_PATH)
@@ -202,47 +226,7 @@ def remove_from_watchlist_db(symbol):
     conn.commit()
     conn.close()
 
-def save_daily_snapshot():
-    cash = get_cash()
-    holdings = get_holdings()
-    total_value = cash
-    for symbol, data in holdings.items():
-        price = get_price(symbol)
-        if price:
-            total_value += price * data["quantity"]
-    today = datetime.now().strftime("%Y-%m-%d")
-    pnl = total_value - STARTING_CASH
-    pnl_pct = (pnl / STARTING_CASH) * 100
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""INSERT INTO daily_pnl (date,portfolio_value,cash,pnl,pnl_pct) VALUES (?,?,?,?,?)
-        ON CONFLICT(date) DO UPDATE SET portfolio_value=?,cash=?,pnl=?,pnl_pct=?""",
-        (today, total_value, cash, pnl, pnl_pct,
-         total_value, cash, pnl, pnl_pct))
-    conn.commit()
-    conn.close()
-    print(f"[SNAPSHOT] {today} — ₹{total_value:.2f} ({pnl_pct:+.2f}%)")
-
-def get_daily_pnl_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT date,portfolio_value,pnl,pnl_pct FROM daily_pnl ORDER BY date DESC LIMIT 30")
-    rows = c.fetchall()
-    conn.close()
-    return [{"date":r[0],"portfolio_value":round(r[1],2),
-             "pnl":round(r[2],2),"pnl_pct":round(r[3],2)} for r in rows]
-
-# --------------------------------------------------
-# Signal log
-# --------------------------------------------------
-signal_log = []
-
-# --------------------------------------------------
-# LOSS COOLDOWN HELPERS
-# Prevents bot from rebuying a stock it just sold at loss
-# --------------------------------------------------
 def add_loss_cooldown(symbol):
-    """Mark this symbol as sold at loss today — do not rebuy"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -251,7 +235,6 @@ def add_loss_cooldown(symbol):
     conn.close()
 
 def is_on_cooldown(symbol):
-    """Check if this symbol was sold at loss today"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -261,13 +244,64 @@ def is_on_cooldown(symbol):
     return result is not None
 
 def clear_old_cooldowns():
-    """Remove cooldowns older than today"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
     c.execute("DELETE FROM loss_cooldown WHERE date < ?", (today,))
     conn.commit()
     conn.close()
+
+def save_daily_snapshot():
+    """Save daily snapshot with cumulative P&L carrying forward"""
+    cash = get_cash()
+    holdings = get_holdings()
+    total_value = cash
+    for symbol, data in holdings.items():
+        price = get_price(symbol)
+        if price:
+            total_value += price * data["quantity"]
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    realized_today = get_todays_realized_pnl()
+
+    # Get yesterday's cumulative PnL to carry forward
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT cumulative_pnl FROM daily_pnl
+        WHERE date < ? ORDER BY date DESC LIMIT 1""", (today,))
+    row = c.fetchone()
+    prev_cumulative = row[0] if row else 0
+
+    cumulative_pnl = prev_cumulative + realized_today
+    pnl_pct = (cumulative_pnl / STARTING_CASH) * 100
+
+    c.execute("""INSERT INTO daily_pnl
+        (date, portfolio_value, cash, realized_pnl_today, cumulative_pnl, pnl_pct)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(date) DO UPDATE SET
+        portfolio_value=?, cash=?, realized_pnl_today=?, cumulative_pnl=?, pnl_pct=?""",
+        (today, total_value, cash, realized_today, cumulative_pnl, pnl_pct,
+         total_value, cash, realized_today, cumulative_pnl, pnl_pct))
+    conn.commit()
+    conn.close()
+    print(f"[SNAPSHOT] {today} | Value:₹{total_value:.2f} | Today:₹{realized_today:.2f} | Cumulative:₹{cumulative_pnl:.2f} ({pnl_pct:+.2f}%)")
+
+def get_daily_pnl_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT date, portfolio_value, realized_pnl_today, cumulative_pnl, pnl_pct
+        FROM daily_pnl ORDER BY date DESC LIMIT 30""")
+    rows = c.fetchall()
+    conn.close()
+    return [{"date":r[0], "portfolio_value":round(r[1],2),
+             "realized_pnl_today":round(r[2],2),
+             "cumulative_pnl":round(r[3],2),
+             "pnl_pct":round(r[4],2)} for r in rows]
+
+# --------------------------------------------------
+# Signal log
+# --------------------------------------------------
+signal_log = []
 
 # --------------------------------------------------
 # INDICATORS
@@ -374,7 +408,6 @@ def analyze_symbol(symbol: str):
         volume_confirms = get_volume_signal(data)
         sentiment = get_news_sentiment(symbol)
 
-        # Scoring
         buy_score = 0
         if rsi < 25: buy_score += 4
         elif rsi < 35: buy_score += 3
@@ -416,15 +449,14 @@ def analyze_symbol(symbol: str):
         return None
 
 # --------------------------------------------------
-# INTRADAY PROFIT CHECKER — runs every scan
-# Sells if profit >= 2% (intraday target)
-# NEVER sells at a loss
+# INTRADAY PROFIT CHECK — NEVER sells at loss
 # --------------------------------------------------
 def check_intraday_profit():
     holdings = get_holdings()
     for symbol, data in holdings.items():
         qty = data["quantity"]
         avg_buy = data["avg_buy_price"]
+        invested = data["invested_amount"]
         if avg_buy == 0 or qty == 0:
             continue
         current_price = get_price(symbol)
@@ -434,37 +466,41 @@ def check_intraday_profit():
         pnl_amount = (current_price - avg_buy) * qty
 
         if pnl_pct >= INTRADAY_PROFIT_TARGET_PCT:
-            # SELL — profit target hit
+            # ✅ SELL — profit target hit
             cash = get_cash()
-            set_cash(cash + current_price * qty)
+            sell_value = current_price * qty
+            set_cash(cash + sell_value)
             update_holding(symbol, 0)
-            add_trade("SELL", symbol, current_price, qty, 100, "AUTO",
-                f"✅ INTRADAY TARGET +{pnl_pct:.2f}% (bought @ ₹{avg_buy})", pnl_amount)
-            print(f"[PROFIT] {symbol} @ ₹{current_price} | +{pnl_pct:.2f}% | ₹{pnl_amount:.2f}")
+            add_trade("SELL", symbol, current_price, qty, invested,
+                100, "AUTO",
+                f"✅ INTRADAY +{pnl_pct:.2f}% | Invested:₹{invested:.0f} → ₹{sell_value:.0f}",
+                pnl_amount)
+            print(f"[PROFIT] {symbol} @ ₹{current_price} | +{pnl_pct:.2f}% | P&L:₹{pnl_amount:.2f}")
 
         elif pnl_pct < 0:
-            # HOLD — NEVER sell at a loss
-            print(f"[HOLD] {symbol} @ ₹{current_price} | {pnl_pct:.2f}% loss — holding, WILL NOT sell")
+            # 🔒 HOLD — never sell at loss
+            print(f"[HOLD] {symbol} | {pnl_pct:.2f}% loss | ₹{pnl_amount:.2f} | WILL NOT SELL")
 
         else:
-            # Small profit — hold until intraday target or EOD
-            print(f"[WAIT] {symbol} @ ₹{current_price} | +{pnl_pct:.2f}% — waiting for target")
+            # ⏳ WAIT — small profit, wait for target or EOD
+            print(f"[WAIT] {symbol} | +{pnl_pct:.2f}% | waiting for +{INTRADAY_PROFIT_TARGET_PCT}% or EOD")
 
 # --------------------------------------------------
 # END OF DAY PROFIT BOOKING — 3:15 PM IST
-# Sells ALL holdings in profit >= 0.5%
-# Holds all losses overnight
+# Sells all profitable positions (>= +0.5%)
+# NEVER sells losses — marks them with cooldown
 # --------------------------------------------------
 def end_of_day_profit_booking():
-    print(f"\n[EOD] ===== End of Day Profit Booking at {datetime.now().strftime('%H:%M:%S')} =====")
+    print(f"\n[EOD] ===== EOD Booking at {datetime.now().strftime('%H:%M:%S')} =====")
     holdings = get_holdings()
-    sold_count = 0
-    held_count = 0
-    total_eod_profit = 0
+    sold = 0
+    held = 0
+    total_profit = 0
 
     for symbol, data in holdings.items():
         qty = data["quantity"]
         avg_buy = data["avg_buy_price"]
+        invested = data["invested_amount"]
         if avg_buy == 0 or qty == 0:
             continue
         current_price = get_price(symbol)
@@ -474,116 +510,136 @@ def end_of_day_profit_booking():
         pnl_amount = (current_price - avg_buy) * qty
 
         if pnl_pct >= EOD_MIN_PROFIT_PCT:
-            # SELL — book the profit
+            # ✅ SELL — book the profit
             cash = get_cash()
-            set_cash(cash + current_price * qty)
+            sell_value = current_price * qty
+            set_cash(cash + sell_value)
             update_holding(symbol, 0)
-            add_trade("SELL", symbol, current_price, qty, 100, "AUTO",
-                f"📅 EOD PROFIT BOOKING +{pnl_pct:.2f}% (bought @ ₹{avg_buy})", pnl_amount)
-            total_eod_profit += pnl_amount
-            sold_count += 1
+            add_trade("SELL", symbol, current_price, qty, invested,
+                100, "AUTO",
+                f"📅 EOD PROFIT +{pnl_pct:.2f}% | ₹{invested:.0f} → ₹{sell_value:.0f}",
+                pnl_amount)
+            total_profit += pnl_amount
+            sold += 1
             print(f"[EOD SELL] {symbol} @ ₹{current_price} | +{pnl_pct:.2f}% | ₹{pnl_amount:.2f}")
         else:
-            # HOLD — loss position, keep overnight
-            # Add cooldown so bot does NOT rebuy this stock tomorrow at a higher price
+            # 🔒 HOLD overnight — add cooldown so bot won't rebuy tomorrow
             add_loss_cooldown(symbol)
-            held_count += 1
-            print(f"[EOD HOLD] {symbol} @ ₹{current_price} | {pnl_pct:.2f}% — holding overnight, cooldown set")
+            held += 1
+            print(f"[EOD HOLD] {symbol} | {pnl_pct:.2f}% | holding overnight")
 
     save_daily_snapshot()
-    print(f"[EOD] Done. Sold: {sold_count} | Held overnight: {held_count} | Today's profit: ₹{total_eod_profit:.2f}")
+    print(f"[EOD] Sold:{sold} | Held:{held} | Profit booked:₹{total_profit:.2f}")
 
 # --------------------------------------------------
-# AUTO-TRADING BOT — BUY LOGIC
+# AUTO-TRADING BOT
+# Scans all stocks, picks TOP 3 best signals, buys smart
 # --------------------------------------------------
 def auto_trade():
     print(f"\n[BOT] ===== Scan at {datetime.now().strftime('%H:%M:%S')} =====")
     global signal_log
 
-    # Clear yesterday's cooldowns
     clear_old_cooldowns()
-
-    # Step 1 — check intraday profit on holdings
     check_intraday_profit()
 
-    # Step 2 — scan watchlist for buy opportunities
-    new_signals = []
-    watchlist = get_watchlist_db()
     holdings = get_holdings()
     cash = get_cash()
 
-    bought_this_scan = 0
+    # If already at max holdings, skip buying
+    if len(holdings) >= MAX_HOLDINGS:
+        print(f"[BOT] Max holdings reached ({MAX_HOLDINGS}). Skipping buys.")
+        return
 
+    slots_available = MAX_HOLDINGS - len(holdings)
+    buys_this_scan = min(MAX_BUYS_PER_SCAN, slots_available)
+
+    # Scan all watchlist stocks
+    watchlist = get_watchlist_db()
+    all_signals = []
+
+    print(f"[BOT] Scanning {len(watchlist)} stocks...")
     for symbol in watchlist:
         result = analyze_symbol(symbol)
         if result is None:
             continue
+        all_signals.append(result)
 
-        new_signals.append(result)
+    signal_log = all_signals
 
-        # Skip if already holding
-        if symbol in holdings:
+    # Filter: only BUY signals, not already holding, not on cooldown
+    candidates = [
+        s for s in all_signals
+        if s["signal"] == "BUY"
+        and s["symbol"] not in holdings
+        and not is_on_cooldown(s["symbol"])
+        and s["sentiment"] != -1
+        and s["current_price"] <= cash * 0.25  # single stock max 25% of cash
+    ]
+
+    # Apply confidence threshold per type
+    candidates = [
+        s for s in candidates
+        if (s["is_large_cap"] and s["confidence"] >= STRONG_CONF)
+        or (not s["is_large_cap"] and s["confidence"] >= DECENT_CONF)
+    ]
+
+    # Sort by confidence + buy_score — pick TOP 3
+    candidates.sort(key=lambda x: (x["confidence"], x["buy_score"]), reverse=True)
+    top_picks = candidates[:buys_this_scan]
+
+    print(f"[BOT] {len(candidates)} candidates → buying top {len(top_picks)}")
+
+    for pick in top_picks:
+        symbol = pick["symbol"]
+        price = pick["current_price"]
+        confidence = pick["confidence"]
+        cash = get_cash()
+
+        # Smart position sizing
+        position_size = get_position_size(confidence, cash)
+
+        # Calculate how many shares we can buy
+        if price <= 0 or position_size < price:
+            print(f"[SKIP] {symbol} — price ₹{price} > position size ₹{position_size:.0f}")
             continue
 
-        price = result["current_price"]
+        qty = int(position_size / price)
+        if qty < 1:
+            qty = 1
 
-        # Skip if not enough cash
-        if cash < price:
+        total_cost = price * qty
+
+        if cash < total_cost:
+            print(f"[SKIP] {symbol} — not enough cash (need ₹{total_cost:.0f}, have ₹{cash:.0f})")
             continue
 
-        # Skip if position too large
-        if price > cash * MAX_POSITION_PCT:
-            continue
+        set_cash(cash - total_cost)
+        update_holding(symbol, qty, price, total_cost)
 
-        # Skip negative news
-        if result["sentiment"] == -1:
-            continue
+        target = round(price * (1 + INTRADAY_PROFIT_TARGET_PCT / 100), 2)
+        eod_target = round(price * (1 + EOD_MIN_PROFIT_PCT / 100), 2)
 
-        # Skip if sold at loss today — do not rebuy at higher price
-        if is_on_cooldown(symbol):
-            print(f"[COOLDOWN] {symbol} — sold at loss today, skipping rebuy")
-            continue
+        add_trade("BUY", symbol, price, qty, total_cost, confidence, "AUTO",
+            f"{'STRONG' if pick['is_large_cap'] else 'DECENT'} | conf:{confidence}% | score:{pick['buy_score']} | RSI:{pick['RSI']} | MACD:{'▲' if pick['MACD_bullish'] else '▼'} | target:₹{target} | eod:₹{eod_target}",
+            0)
 
-        confidence = result["confidence"]
-        is_large = result["is_large_cap"]
-        min_conf = STRONG_CONF if is_large else DECENT_CONF
+        print(f"[BUY] {symbol} | qty:{qty} | ₹{total_cost:.0f} invested | conf:{confidence}% | target:₹{target}")
 
-        if confidence >= min_conf and result["signal"] == "BUY":
-            set_cash(cash - price)
-            update_holding(symbol, 1, price)
-            target = round(price * (1 + INTRADAY_PROFIT_TARGET_PCT / 100), 2)
-            add_trade("BUY", symbol, price, 1, confidence, "AUTO",
-                f"{'STRONG' if is_large else 'DECENT'} | Score:{result['buy_score']} RSI:{result['RSI']} MACD:{'▲' if result['MACD_bullish'] else '▼'} Vol:{'✓' if result['volume_confirms'] else '✗'} | Target:₹{target}",
-                0)
-            cash = get_cash()
-            bought_this_scan += 1
-            print(f"[BUY] {symbol} @ ₹{price} | conf:{confidence}% | target:₹{target}")
-
-    signal_log = new_signals
-    print(f"[BOT] Done. Scanned:{len(new_signals)} | Bought:{bought_this_scan} | Holdings:{len(get_holdings())} | Cash:₹{get_cash():.2f}")
+    remaining = get_cash()
+    print(f"[BOT] Done | Holdings:{len(get_holdings())}/{MAX_HOLDINGS} | Cash:₹{remaining:.2f}")
 
 # --------------------------------------------------
 # SCHEDULER
 # --------------------------------------------------
 scheduler = BackgroundScheduler()
-
-# Scan every 5 minutes
 scheduler.add_job(auto_trade, "interval", minutes=5, id="auto_trade")
-
-# End of day — 3:15 PM IST = 09:45 UTC
-scheduler.add_job(end_of_day_profit_booking, "cron",
-                  hour=9, minute=45, id="eod_nse",
-                  timezone="UTC")
-
+# NSE EOD — 3:15 PM IST = 09:45 UTC
+scheduler.add_job(end_of_day_profit_booking, "cron", hour=9, minute=45, id="eod_nse", timezone="UTC")
 # NYSE EOD — 9:55 PM IST = 16:25 UTC
-scheduler.add_job(end_of_day_profit_booking, "cron",
-                  hour=16, minute=25, id="eod_nyse",
-                  timezone="UTC")
-
-# Daily snapshots
-scheduler.add_job(save_daily_snapshot, "cron", hour=10, minute=5, id="nse_snapshot")
-scheduler.add_job(save_daily_snapshot, "cron", hour=21, minute=5, id="nyse_snapshot")
-
+scheduler.add_job(end_of_day_profit_booking, "cron", hour=16, minute=25, id="eod_nyse", timezone="UTC")
+# Snapshots
+scheduler.add_job(save_daily_snapshot, "cron", hour=10, minute=5, id="snap_nse")
+scheduler.add_job(save_daily_snapshot, "cron", hour=21, minute=5, id="snap_nyse")
 scheduler.start()
 
 # --------------------------------------------------
@@ -591,14 +647,14 @@ scheduler.start()
 # --------------------------------------------------
 @app.get("/")
 def home():
+    holdings = get_holdings()
     return {
-        "message": "AI Trading Bot — Daily Profit Strategy",
-        "intraday_target": f"+{INTRADAY_PROFIT_TARGET_PCT}%",
-        "eod_min_profit": f"+{EOD_MIN_PROFIT_PCT}%",
-        "loss_handling": "HOLD — never sell at loss",
-        "eod_sell_time": "3:15 PM IST (NSE) + 9:55 PM IST (NYSE)",
+        "status": "AI Trading Bot Running",
+        "strategy": f"Top {MAX_BUYS_PER_SCAN} signals per scan | Sell at +{INTRADAY_PROFIT_TARGET_PCT}% | EOD sell at +{EOD_MIN_PROFIT_PCT}% | Hold losses",
+        "current_holdings": len(holdings),
+        "max_holdings": MAX_HOLDINGS,
         "watchlist_size": len(get_watchlist_db()),
-        "auto_trading": "ACTIVE"
+        "cash": round(get_cash(), 2)
     }
 
 @app.get("/stock/{symbol}")
@@ -629,24 +685,26 @@ def buy_stock(symbol: str, quantity: int = 1):
     if price is None:
         return {"error": "Invalid symbol"}
     cash = get_cash()
-    if cash < price * quantity:
-        return {"error": "Not enough cash"}
+    total_cost = price * quantity
+    if cash < total_cost:
+        return {"error": f"Not enough cash. Need ₹{total_cost}, have ₹{cash:.0f}"}
     holdings = get_holdings()
     existing_qty = holdings.get(symbol, {}).get("quantity", 0)
     existing_avg = holdings.get(symbol, {}).get("avg_buy_price", 0)
     new_qty = existing_qty + quantity
     new_avg = ((existing_avg * existing_qty) + (price * quantity)) / new_qty
-    set_cash(cash - price * quantity)
-    update_holding(symbol, new_qty, new_avg)
+    set_cash(cash - total_cost)
+    update_holding(symbol, new_qty, new_avg, total_cost)
     target = round(price * (1 + INTRADAY_PROFIT_TARGET_PCT / 100), 2)
-    eod_target = round(price * (1 + EOD_MIN_PROFIT_PCT / 100), 2)
-    add_trade("BUY", symbol, price, quantity, 0, "MANUAL",
-              f"Manual | Target:₹{target} | EOD min:₹{eod_target}", 0)
+    eod_min = round(price * (1 + EOD_MIN_PROFIT_PCT / 100), 2)
+    add_trade("BUY", symbol, price, quantity, total_cost, 0, "MANUAL",
+              f"Manual buy | target:₹{target} | eod_min:₹{eod_min}", 0)
     return {
         "message": f"Bought {quantity} share(s) of {symbol}",
         "price": price,
+        "invested": total_cost,
         "intraday_target": target,
-        "eod_min_sell": eod_target,
+        "eod_min_sell": eod_min,
         "cash_remaining": round(get_cash(), 2)
     }
 
@@ -659,13 +717,15 @@ def sell_stock(symbol: str, quantity: int = 1):
     if price is None:
         return {"error": "Invalid symbol"}
     avg_buy = holdings[symbol]["avg_buy_price"]
+    invested = holdings[symbol]["invested_amount"]
     pnl = (price - avg_buy) * quantity
     pnl_pct = ((price - avg_buy) / avg_buy) * 100
     cash = get_cash()
-    set_cash(cash + price * quantity)
+    sell_value = price * quantity
+    set_cash(cash + sell_value)
     new_qty = holdings[symbol]["quantity"] - quantity
-    update_holding(symbol, new_qty, avg_buy)
-    add_trade("SELL", symbol, price, quantity, 0, "MANUAL",
+    update_holding(symbol, new_qty, avg_buy, invested)
+    add_trade("SELL", symbol, price, quantity, invested, 0, "MANUAL",
               f"Manual sell | P&L:{'+' if pnl>=0 else ''}₹{pnl:.2f} ({pnl_pct:+.2f}%)", pnl)
     return {
         "message": f"Sold {quantity} share(s) of {symbol}",
@@ -677,32 +737,8 @@ def sell_stock(symbol: str, quantity: int = 1):
 
 @app.post("/eod-sell")
 def manual_eod_sell():
-    """Manually trigger EOD profit booking"""
     end_of_day_profit_booking()
-    return {"message": "EOD profit booking complete"}
-
-@app.get("/portfolio/value")
-def portfolio_value():
-    cash = get_cash()
-    holdings = get_holdings()
-    total_stock_value = 0.0
-    stock_details = {}
-    for symbol, data in holdings.items():
-        price = get_price(symbol)
-        if price is None:
-            continue
-        value = price * data["quantity"]
-        total_stock_value += value
-        stock_details[symbol] = {
-            "quantity": data["quantity"],
-            "current_price": price,
-            "total_value": round(value, 2)
-        }
-    return {
-        "cash": round(cash, 2),
-        "stocks": stock_details,
-        "total_portfolio_value": round(cash + total_stock_value, 2)
-    }
+    return {"message": "EOD profit booking complete", "realized_today": get_todays_realized_pnl()}
 
 @app.get("/portfolio/pnl")
 def portfolio_pnl():
@@ -715,12 +751,12 @@ def portfolio_pnl():
     for symbol, data in holdings.items():
         qty = data["quantity"]
         avg_buy = data["avg_buy_price"]
+        invested = data["invested_amount"]
         if qty == 0:
             continue
         current_price = get_price(symbol)
         if current_price is None:
             continue
-        invested = avg_buy * qty
         current_value = current_price * qty
         pnl = current_value - invested
         pnl_pct = ((current_price - avg_buy) / avg_buy * 100) if avg_buy > 0 else 0
@@ -747,10 +783,14 @@ def portfolio_pnl():
         }
 
     total_pnl = total_current - total_invested
+    realized_today = get_todays_realized_pnl()
+
+    # Get cumulative realized PnL from daily_pnl table
+    daily = get_daily_pnl_db()
+    cumulative_realized = daily[0]["cumulative_pnl"] if daily else 0
+
     overall_pnl = (cash + total_current) - STARTING_CASH
     overall_pnl_pct = (overall_pnl / STARTING_CASH) * 100
-    all_trades = get_all_trades()
-    realized_pnl = sum(t["pnl"] for t in all_trades if t["type"] == "SELL")
 
     return {
         "holdings": pnl_details,
@@ -762,9 +802,35 @@ def portfolio_pnl():
         "portfolio_value": round(cash + total_current, 2),
         "overall_pnl": round(overall_pnl, 2),
         "overall_pnl_pct": round(overall_pnl_pct, 2),
-        "realized_pnl": round(realized_pnl, 2),
+        "realized_today": realized_today,
+        "cumulative_realized": round(cumulative_realized, 2),
         "intraday_target_pct": INTRADAY_PROFIT_TARGET_PCT,
-        "eod_min_profit_pct": EOD_MIN_PROFIT_PCT
+        "eod_min_profit_pct": EOD_MIN_PROFIT_PCT,
+        "max_holdings": MAX_HOLDINGS,
+        "current_holdings": len(holdings)
+    }
+
+@app.get("/portfolio/value")
+def portfolio_value():
+    cash = get_cash()
+    holdings = get_holdings()
+    total_stock_value = 0.0
+    stock_details = {}
+    for symbol, data in holdings.items():
+        price = get_price(symbol)
+        if price is None:
+            continue
+        value = price * data["quantity"]
+        total_stock_value += value
+        stock_details[symbol] = {
+            "quantity": data["quantity"],
+            "current_price": price,
+            "total_value": round(value, 2)
+        }
+    return {
+        "cash": round(cash, 2),
+        "stocks": stock_details,
+        "total_portfolio_value": round(cash + total_stock_value, 2)
     }
 
 @app.get("/daily-pnl")
@@ -775,18 +841,19 @@ def get_daily_pnl():
 def get_daily_trades():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""SELECT type,symbol,price,quantity,confidence,mode,reason,pnl,time
+    c.execute("""SELECT type,symbol,price,quantity,invested,confidence,mode,reason,pnl,time
         FROM trades ORDER BY time DESC LIMIT 500""")
     rows = c.fetchall()
     conn.close()
 
     grouped = defaultdict(list)
     for r in rows:
-        date = r[8][:10]
+        date = r[9][:10]
         grouped[date].append({
             "type": r[0], "symbol": r[1], "price": r[2],
-            "quantity": r[3], "confidence": r[4], "mode": r[5],
-            "reason": r[6], "pnl": round(r[7], 2), "time": r[8]
+            "quantity": r[3], "invested": round(r[4], 2),
+            "confidence": r[5], "mode": r[6],
+            "reason": r[7], "pnl": round(r[8], 2), "time": r[9]
         })
 
     result = []
@@ -795,12 +862,14 @@ def get_daily_trades():
         buys = [t for t in day_trades if t["type"] == "BUY"]
         sells = [t for t in day_trades if t["type"] == "SELL"]
         realized = sum(t["pnl"] for t in sells)
+        total_invested = sum(t["invested"] for t in buys)
         result.append({
             "date": date,
             "trades": day_trades,
             "total_trades": len(day_trades),
             "buys": len(buys),
             "sells": len(sells),
+            "total_invested_today": round(total_invested, 2),
             "realized_pnl": round(realized, 2)
         })
     return result
@@ -843,6 +912,7 @@ def get_stats():
     loss_trades = [t for t in sell_trades if t["pnl"] <= 0]
     realized_pnl = sum(t["pnl"] for t in sell_trades)
     win_rate = round((len(profit_trades) / len(sell_trades) * 100) if sell_trades else 0, 1)
+    daily = get_daily_pnl_db()
     return {
         "total_trades": len(trades),
         "total_buys": len([t for t in trades if t["type"] == "BUY"]),
@@ -851,10 +921,14 @@ def get_stats():
         "loss_sells": len(loss_trades),
         "win_rate_pct": win_rate,
         "realized_pnl": round(realized_pnl, 2),
+        "realized_today": get_todays_realized_pnl(),
+        "cumulative_pnl": daily[0]["cumulative_pnl"] if daily else 0,
         "auto_trades": len([t for t in trades if t["mode"] == "AUTO"]),
         "manual_trades": len([t for t in trades if t["mode"] == "MANUAL"]),
         "watchlist_size": len(get_watchlist_db()),
         "current_holdings": len(get_holdings()),
+        "max_holdings": MAX_HOLDINGS,
+        "max_buys_per_scan": MAX_BUYS_PER_SCAN,
         "intraday_target_pct": INTRADAY_PROFIT_TARGET_PCT,
         "eod_min_profit_pct": EOD_MIN_PROFIT_PCT,
         "loss_strategy": "HOLD — never sell at loss"
