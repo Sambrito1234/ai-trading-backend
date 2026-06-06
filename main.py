@@ -422,7 +422,17 @@ def analyze_symbol(symbol: str):
         elif sentiment == -1: buy_score -= 3
 
         confidence = min(95, int(50 + (buy_score / 15) * 50))
-        signal = "BUY" if buy_score >= 4 else "WATCH"
+
+        # Stricter buy condition:
+        # Must have MACD bullish OR RSI very oversold (< 25)
+        # Prevents buying on bearish momentum
+        strong_enough = (
+            (macd_bullish and buy_score >= 5) or  # bullish trend + decent score
+            (rsi < 25 and buy_score >= 4) or       # very oversold
+            (rsi < 30 and macd_bullish)             # oversold + bullish
+        )
+
+        signal = "BUY" if strong_enough else "WATCH"
 
         return {
             "symbol": symbol,
@@ -553,11 +563,16 @@ def auto_trade():
     slots_available = MAX_HOLDINGS - len(holdings)
     buys_this_scan = min(MAX_BUYS_PER_SCAN, slots_available)
 
+    if buys_this_scan <= 0:
+        print(f"[BOT] No slots available. Holdings: {len(holdings)}/{MAX_HOLDINGS}")
+        signal_log = []
+        return
+
     # Scan all watchlist stocks
     watchlist = get_watchlist_db()
     all_signals = []
 
-    print(f"[BOT] Scanning {len(watchlist)} stocks...")
+    print(f"[BOT] Scanning {len(watchlist)} stocks... ({buys_this_scan} buy slots open)")
     for symbol in watchlist:
         result = analyze_symbol(symbol)
         if result is None:
@@ -607,6 +622,12 @@ def auto_trade():
         if qty < 1:
             qty = 1
 
+        # Cap quantity — never buy more than 10 shares of any single stock
+        # This prevents buying 73 NVDA or 20000 ADA
+        MAX_QTY_PER_TRADE = 10
+        if qty > MAX_QTY_PER_TRADE:
+            qty = MAX_QTY_PER_TRADE
+
         total_cost = price * qty
 
         if cash < total_cost:
@@ -655,6 +676,25 @@ def home():
         "max_holdings": MAX_HOLDINGS,
         "watchlist_size": len(get_watchlist_db()),
         "cash": round(get_cash(), 2)
+    }
+
+@app.post("/reset")
+def reset_portfolio():
+    """Reset portfolio to starting state — clears all holdings and trades"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM holdings")
+    c.execute("DELETE FROM trades")
+    c.execute("DELETE FROM daily_pnl")
+    c.execute("DELETE FROM loss_cooldown")
+    c.execute("UPDATE portfolio SET cash=?", (STARTING_CASH,))
+    conn.commit()
+    conn.close()
+    print("[RESET] Portfolio reset to starting state")
+    return {
+        "message": "Portfolio reset successfully",
+        "cash": STARTING_CASH,
+        "holdings": 0
     }
 
 @app.get("/stock/{symbol}")
