@@ -7,6 +7,7 @@ import numpy as np
 import sqlite3
 from datetime import datetime
 from collections import defaultdict
+from watchlist_builder import build_full_watchlist, get_nifty200_fallback, get_sp500_fallback, get_crypto
 
 app = FastAPI()
 
@@ -677,6 +678,15 @@ def home():
         "watchlist_size": len(get_watchlist_db()),
         "cash": round(get_cash(), 2)
     }
+
+@app.post("/watchlist/refresh")
+def refresh_watchlist():
+    """Manually refresh watchlist from live sources"""
+    try:
+        symbols = build_full_watchlist()
+        return {"message": "Watchlist refreshed", "total": len(symbols)}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/reset")
 def reset_portfolio():
