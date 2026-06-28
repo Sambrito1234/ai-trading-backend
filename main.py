@@ -22,8 +22,8 @@ MAX_BUYS_PER_SCAN          = 3
 MAX_QTY_PER_TRADE          = 10
 SCAN_BATCH_SIZE            = 200
 STARTING_CASH              = 100000.0
-STRONG_CONF                = 70
-DECENT_CONF                = 60
+STRONG_CONF                = 75
+DECENT_CONF                = 75  # same for both now
 
 LARGE_CAP = {
     "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","SBIN.NS","ICICIBANK.NS",
@@ -370,6 +370,18 @@ def analyze_symbol(symbol:str):
         vol_ok = get_volume_signal(data)
         sentiment = get_news_sentiment(symbol)
 
+        # --- DOWNTREND DETECTION ---
+        # Check last 3 days price direction
+        last3 = close.iloc[-3:].tolist()
+        falling_3_days = last3[0] > last3[1] > last3[2]  # price dropped 3 days straight
+
+        # Check if price is below 20-day average (downtrend)
+        below_sma20 = current_price < sma20
+
+        # If BOTH conditions are true — stock is in downtrend, skip it
+        in_downtrend = falling_3_days and below_sma20
+
+        # --- SCORING ---
         score = 0
         if rsi < 25: score += 4
         elif rsi < 35: score += 3
@@ -382,13 +394,24 @@ def analyze_symbol(symbol:str):
         if sentiment == 1: score += 2
         elif sentiment == -1: score -= 3
 
+        # Penalize downtrend heavily
+        if falling_3_days: score -= 2
+        if below_sma20: score -= 1
+
         confidence = min(95, int(50 + (score/15)*50))
 
-        # Strict: MACD bullish OR very oversold
+        # Strict buy conditions:
+        # 1. Must NOT be in downtrend (falling 3 days AND below SMA20)
+        # 2. MACD must be bullish OR RSI extremely oversold
+        # 3. Sentiment must not be negative
         strong_enough = (
-            (macd_bullish and score >= 5) or
-            (rsi < 25 and score >= 4) or
-            (rsi < 30 and macd_bullish)
+            not in_downtrend and
+            sentiment != -1 and
+            (
+                (macd_bullish and score >= 6) or
+                (rsi < 25 and score >= 5) or
+                (rsi < 30 and macd_bullish and score >= 5)
+            )
         )
         signal = "BUY" if strong_enough else "WATCH"
 
@@ -399,6 +422,9 @@ def analyze_symbol(symbol:str):
             "volume_confirms":vol_ok, "sentiment":sentiment,
             "buy_score":score, "signal":signal, "confidence":confidence,
             "is_large_cap":symbol in LARGE_CAP,
+            "falling_3_days":falling_3_days,
+            "below_sma20":below_sma20,
+            "in_downtrend":in_downtrend,
             "scanned_at":datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
     except Exception as e:
@@ -497,14 +523,26 @@ def auto_trade():
 
     signal_log = all_signals
 
+    # Log skipped stocks so you can see why bot didn't buy
+    for s in all_signals:
+        if s["signal"] == "WATCH":
+            reasons = []
+            if s.get("in_downtrend"): reasons.append("DOWNTREND")
+            if s.get("falling_3_days"): reasons.append("FALLING 3 DAYS")
+            if s.get("below_sma20"): reasons.append("BELOW SMA20")
+            if s["sentiment"] == -1: reasons.append("BAD NEWS")
+            if s["confidence"] < STRONG_CONF: reasons.append(f"LOW CONF {s['confidence']}%")
+            if reasons:
+                print(f"[SKIP] {s['symbol']} — {', '.join(reasons)}")
+
     candidates = [
         s for s in all_signals
         if s["signal"]=="BUY"
         and s["symbol"] not in holdings
         and not is_on_cooldown(s["symbol"])
+        and not s.get("in_downtrend", False)
         and s["sentiment"] != -1
-        and ((s["is_large_cap"] and s["confidence"]>=STRONG_CONF)
-             or (not s["is_large_cap"] and s["confidence"]>=DECENT_CONF))
+        and s["confidence"] >= STRONG_CONF
     ]
 
     candidates.sort(key=lambda x:(x["confidence"],x["buy_score"]),reverse=True)
